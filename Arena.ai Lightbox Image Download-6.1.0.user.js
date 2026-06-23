@@ -24,8 +24,8 @@
 // @connect      *.gstatic.com
 // @connect      *.googleusercontent.com
 // @run-at       document-idle
-// @updateURL    https://github.com/TheSicknesszar/my-userscripts.git
-// @downloadURL  https://github.com/TheSicknesszar/my-userscripts.git
+// @updateURL    https://github.com/TheSicknesszar/my-tampermonkey-userscripts#
+// @downloadURL  https://github.com/TheSicknesszar/my-tampermonkey-userscripts#
 // ==/UserScript==
 
 (function() {
