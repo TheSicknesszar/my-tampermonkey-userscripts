@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Arena.ai Lightbox Image Download
+// @name         Arena.ai Lightbox Enhanced + Batch Download
 // @namespace    http://tampermonkey.net/
-// @version      6.1.0
-// @description  Arena.ai Image Lightbox with original/edited detection, EXIF metadata, zoom, touch + Batch download with progress overlay - Enhanced & Secure
+// @version      6.1.1
+// @description  Lightbox with original/edited detection, EXIF metadata, zoom, touch + Batch download with progress overlay - Enhanced & Secure
 // @author       TheSicknesszar
 // @match        https://arena.ai/*
 // @match        https://chat.lmsys.org/*
@@ -16,6 +16,7 @@
 // @grant        GM_getValue
 // @grant        GM_download
 // @grant        GM_openInTab
+// @grant        GM_info
 // @connect      self
 // @connect      *.arena.ai
 // @connect      *.lmsys.org
@@ -24,8 +25,8 @@
 // @connect      *.gstatic.com
 // @connect      *.googleusercontent.com
 // @run-at       document-idle
-// @updateURL    https://github.com/TheSicknesszar/my-tampermonkey-userscripts#
-// @downloadURL  https://github.com/TheSicknesszar/my-tampermonkey-userscripts#
+// @updateURL    https://raw.githubusercontent.com/TheSicknesszar/my-tampermonkey-userscripts/main/Arena-AI_Lightbox_Enhanced.js
+// @downloadURL  https://raw.githubusercontent.com/TheSicknesszar/my-tampermonkey-userscripts/main/Arena-AI_Lightbox_Enhanced.js
 // ==/UserScript==
 
 (function() {
@@ -91,11 +92,20 @@ const CONFIG = loadConfig();
 
 function loadConfig() {
     const saved = GM_getValue('lma_userConfig', {});
-    return { ...DEFAULT_CONFIG, ...saved };
+    const merged = { ...DEFAULT_CONFIG, ...saved };
+    if (saved.USER_PATTERNS) {
+        merged.USER_PATTERNS = {
+            ORIGINAL: (saved.USER_PATTERNS.ORIGINAL || []).map(p => typeof p === 'string' ? new RegExp(p, 'i') : p),
+            EDITED: (saved.USER_PATTERNS.EDITED || []).map(p => typeof p === 'string' ? new RegExp(p, 'i') : p)
+        };
+    }
+    return merged;
 }
 
 function saveConfig(partialConfig) {
-    GM_setValue('lma_userConfig', { ...DEFAULT_CONFIG, ...partialConfig });
+    const updated = { ...DEFAULT_CONFIG, ...partialConfig };
+    GM_setValue('lma_userConfig', updated);
+    Object.assign(CONFIG, updated);
 }
 
 // ================== STATE ==================
@@ -116,7 +126,6 @@ let state = {
     isDragging: false,
     dragStart: { x: 0, y: 0 },
     initialized: false,
-    retryCount: 0,
     // Batch Download State
     batchCancelled: false,
     batchInProgress: false,
@@ -149,7 +158,6 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ✅ XSS Protection: Sanitize HTML output
 function escapeHtml(str) {
     if (typeof str !== 'string') return String(str);
     const div = document.createElement('div');
@@ -157,13 +165,12 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-// ✅ Simple hash for URL caching (not cryptographic, just for dedup)
 async function simpleHash(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
         const char = str.charCodeAt(i);
         hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32-bit integer
+        hash = hash & hash;
     }
     return Math.abs(hash).toString(36);
 }
@@ -181,7 +188,7 @@ function getPageEntityName() {
     const og = document.querySelector('meta[property="og:title"]');
     if (og?.content) return sanitizeFilename(og.content.split(' - ')[0].trim());
     if (document.title) {
-        const t = document.title.replace(/\s*[–—-]\s*(IMDb|Official Site|Photos|Gallery).*$/i, '').trim();
+        const t = document.title.replace(/\s*[–—-]\s*(Official Site|Photos|Gallery).*$/i, '').trim();
         if (t) return sanitizeFilename(t);
     }
     return 'arena_images';
@@ -189,12 +196,12 @@ function getPageEntityName() {
 
 function getThumbnailUrl(url) {
     if (!url) return url;
-    // Avoid modifying data/blob URLs
     if (url.startsWith('data:') || url.startsWith('blob:')) return url;
-    return url.replace(/\?.*$/, '') + '?w=100&h=100&fit=crop';
+    const hasQuery = url.includes('?');
+    return url + (hasQuery ? '&' : '?') + 'w=100&h=100&fit=crop';
 }
 
-// ✅ Blob URL Management - Prevent Memory Leaks
+// Blob URL Management - Prevent Memory Leaks
 function createBlobUrl(blob) {
     return URL.createObjectURL(blob);
 }
@@ -210,6 +217,25 @@ function cleanupAllBlobUrls() {
         revokeBlobUrl(blobUrl);
     }
     state.preloadedImages.clear();
+}
+
+// Shared fetchAsBlob helper - reduces GM_xmlhttpRequest duplication
+function fetchAsBlob(url) {
+    return new Promise((resolve, reject) => {
+        if (!url || url.startsWith('data:')) { resolve(null); return; }
+        GM_xmlhttpRequest({
+            method: 'GET', url: url, responseType: 'blob',
+            onload: function(resp) {
+                if (resp.status >= 200 && resp.status < 300) {
+                    const blobUrl = createBlobUrl(resp.response);
+                    resolve(blobUrl);
+                } else {
+                    resolve(null);
+                }
+            },
+            onerror: function() { resolve(null); }
+        });
+    });
 }
 
 // ================== CSS STYLES (with CSS Variables & Fallbacks) ==================
@@ -461,7 +487,7 @@ const css = `
     border-radius: 4px;
 }
 
-/* === BATCH DOWNLOAD OVERLAY (IMDb Style) === */
+/* === BATCH DOWNLOAD OVERLAY === */
 @keyframes lma-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
 @keyframes lma-pop { 0% { transform: scale(1) } 50% { transform: scale(1.12) } 100% { transform: scale(1) } }
 @keyframes lma-glow { 0% { box-shadow: 0 0 10px rgba(39,174,96,0.8) } 100% { box-shadow: none } }
@@ -572,6 +598,35 @@ const css = `
     font-size: 14px; font-weight: 600; transition: background var(--lma-transition-fast);
 }
 #lma-batch-cancel:hover { background: #c0392b; }
+
+/* === CONFIRM MODAL === */
+#lma-confirm-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+    z-index: calc(var(--lma-zindex-overlay) + 2); display: flex;
+    align-items: center; justify-content: center; font-family: system-ui, sans-serif;
+}
+.lma-confirm-card {
+    background: var(--lma-bg-card); color: #eee; padding: 24px 28px;
+    border-radius: 14px; width: 400px; max-width: 90vw;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column; gap: 16px;
+}
+.lma-confirm-card p { margin: 0; font-size: 15px; line-height: 1.5; }
+.lma-confirm-actions {
+    display: flex; justify-content: flex-end; gap: 10px;
+}
+.lma-confirm-actions button {
+    padding: 8px 22px; border-radius: 8px; cursor: pointer;
+    font-size: 14px; font-weight: 600; border: none; transition: background var(--lma-transition-fast);
+}
+.lma-confirm-cancel {
+    background: #555; color: #fff;
+}
+.lma-confirm-cancel:hover { background: #777; }
+.lma-confirm-ok {
+    background: var(--lma-primary); color: #fff;
+}
+.lma-confirm-ok:hover { background: #388E3C; }
 
 /* === BATCH BUTTON IN LIGHTBOX === */
 #lma-batch-btn {
@@ -811,7 +866,6 @@ async function fetchMetadata(imgElement) {
         return { note: 'Cannot fetch EXIF for data/blob URLs' };
     }
 
-    // ✅ Check cache first
     const urlHash = await simpleHash(src);
     if (state.exifCache.has(urlHash)) {
         return state.exifCache.get(urlHash);
@@ -824,7 +878,7 @@ async function fetchMetadata(imgElement) {
                 if (resp.status >= 200 && resp.status < 300) {
                     ExifParser.parse(resp.response)
                         .then(tags => {
-                            state.exifCache.set(urlHash, tags); // ✅ Cache result
+                            state.exifCache.set(urlHash, tags);
                             resolve(tags);
                         })
                         .catch(err => {
@@ -998,7 +1052,7 @@ function createLightbox() {
     elements.metadataContent = document.getElementById('lma-metadata-content');
 }
 
-// ✅ Focus Trap for Accessibility
+// Focus Trap for Accessibility
 function trapFocus(element) {
     const focusable = element.querySelectorAll(
         'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
@@ -1024,12 +1078,13 @@ function trapFocus(element) {
 // ================== LIGHTBOX ACTIONS ==================
 function openLightbox(index) {
     if (!state.allImages.length) { log('No images to show', 'warn'); return; }
+    if (state.isOpen) return;
     state.lastFocusedElement = document.activeElement;
     state.isOpen = true;
     elements.lightbox.classList.add('active');
     document.body.style.overflow = 'hidden';
 
-    // ✅ Set up focus trap
+    if (state.focusTrapCleanup) state.focusTrapCleanup();
     state.focusTrapCleanup = trapFocus(elements.lightbox);
 
     navigateTo(index);
@@ -1042,13 +1097,11 @@ function closeLightbox() {
     elements.lightbox.classList.remove('active');
     document.body.style.overflow = '';
 
-    // ✅ Clean up focus trap
     if (state.focusTrapCleanup) {
         state.focusTrapCleanup();
         state.focusTrapCleanup = null;
     }
 
-    // ✅ Revoke all blob URLs to prevent memory leaks
     cleanupAllBlobUrls();
 
     resetZoomAndPan();
@@ -1082,40 +1135,36 @@ function updateBatchCount() {
     }
 }
 
-// ✅ Lazy Preloading Strategy
+// Lazy Preloading Strategy
 function preloadSingleImage(img) {
     if (!img) return;
     const src = img.src;
-    if (!src || state.preloadedImages.has(src)) return;
+    if (!src) return;
 
-    GM_xmlhttpRequest({
-        method: 'GET', url: src, responseType: 'blob',
-        onload: (resp) => {
-            if (resp.status >= 200 && resp.status < 300) {
-                const blob = resp.response;
-                const blobUrl = createBlobUrl(blob);
-                state.preloadedImages.set(src, blobUrl);
+    if (state.preloadedImages.has(src)) return;
+
+    fetchAsBlob(src).then(blobUrl => {
+        if (blobUrl) {
+            if (state.preloadedImages.has(src)) {
+                revokeBlobUrl(state.preloadedImages.get(src));
             }
+            state.preloadedImages.set(src, blobUrl);
         }
-    });
+    }).catch(() => {});
 }
 
 function preloadNeighbors(index) {
-    // Preload only 1 neighbor immediately for performance
-    const nextIndex = index + 1;
-    if (nextIndex < state.allImages.length) {
-        preloadSingleImage(state.allImages[nextIndex]);
-    }
-
-    // Preload second neighbor after delay (if still viewing same image)
-    setTimeout(() => {
-        if (state.isOpen && state.currentIndex === index) {
-            const nextNext = index + 2;
-            if (nextNext < state.allImages.length) {
-                preloadSingleImage(state.allImages[nextNext]);
-            }
+    const count = CONFIG.PRELOAD_NEIGHBORS;
+    for (let i = 1; i <= count; i++) {
+        const idx = index + i;
+        if (idx < state.allImages.length) {
+            setTimeout(() => {
+                if (state.isOpen && state.currentIndex === index) {
+                    preloadSingleImage(state.allImages[idx]);
+                }
+            }, (i - 1) * 500);
         }
-    }, 500);
+    }
 }
 
 function loadImageAtIndex(index) {
@@ -1131,30 +1180,31 @@ function loadImageAtIndex(index) {
     elements.filenameEl.textContent = filename;
     elements.counterEl.textContent = (index + 1) + ' / ' + state.allImages.length;
 
+    // Reset metadata panel to "Loading..." when navigating
+    if (state.metadataPanelVisible) {
+        elements.metadataContent.innerHTML = 'Loading...';
+    }
+
     if (state.preloadedImages.has(src)) {
         const blobUrl = state.preloadedImages.get(src);
         setImageSrc(blobUrl, filename);
-        // Fetch metadata for preloaded image
         fetchAndDisplayMetadata(img);
     } else {
-        GM_xmlhttpRequest({
-            method: 'GET', url: src, responseType: 'blob',
-            onload: (resp) => {
-                if (resp.status >= 200 && resp.status < 300) {
-                    const blob = resp.response;
-                    const blobUrl = createBlobUrl(blob);
-                    state.preloadedImages.set(src, blobUrl);
-                    setImageSrc(blobUrl, filename);
-                    fetchAndDisplayMetadata(img, blob);
-                } else {
-                    setImageSrc(src, filename);
-                    log('Failed to fetch image: ' + resp.status, 'error');
+        fetchAsBlob(src).then(blobUrl => {
+            if (blobUrl) {
+                if (state.preloadedImages.has(src)) {
+                    revokeBlobUrl(state.preloadedImages.get(src));
                 }
-            },
-            onerror: (err) => {
+                state.preloadedImages.set(src, blobUrl);
+                setImageSrc(blobUrl, filename);
+                fetchAndDisplayMetadata(img);
+            } else {
                 setImageSrc(src, filename);
-                log('Network error fetching image', 'error');
+                log('Failed to fetch image', 'error');
             }
+        }).catch(() => {
+            setImageSrc(src, filename);
+            log('Network error fetching image', 'error');
         });
     }
 }
@@ -1173,7 +1223,6 @@ function setImageSrc(src, filename) {
         log('Image failed to load', 'error');
     };
     elements.mainImg.src = src;
-    elements.downloadBtn.onclick = () => downloadImage(src, filename);
 }
 
 function downloadImage(url, filename) {
@@ -1209,24 +1258,19 @@ async function fetchAndDisplayMetadata(imgElement, blob = null) {
 function updateMetadataPanel(imgElement, metadata) {
     const detection = detectImageType(imgElement, metadata);
 
-    // Update type indicator
     elements.metaType.className = 'lma-type-indicator-metadata ' + detection.type;
     elements.metaType.textContent = detection.type.charAt(0).toUpperCase() + detection.type.slice(1);
 
-    // Update detection info
     elements.detectionType.textContent = detection.type;
     elements.detectionConfidence.textContent = detection.confidence + '%';
     elements.confidenceFill.style.width = detection.confidence + '%';
     elements.confidenceFill.className = 'lma-confidence-fill ' +
         (detection.confidence >= 70 ? 'high' : detection.confidence >= 40 ? 'medium' : 'low');
 
-    // ✅ Update ARIA value for progress bar
     elements.confidenceFill.parentElement.setAttribute('aria-valuenow', detection.confidence);
 
-    // ✅ Sanitize reasons output
-    elements.detectionReasons.textContent = detection.reasons.map(escapeHtml).join('; ') || 'None';
+    elements.detectionReasons.textContent = detection.reasons.join('; ') || 'None';
 
-    // ✅ Sanitize and render metadata content
     let html = '';
     if (metadata.error) {
         html = '<div class="lma-metadata-item"><span class="lma-metadata-label">Error:</span>' +
@@ -1286,70 +1330,38 @@ function rotate(clockwise = true) {
     applyTransform();
 }
 
-// ================== BATCH DOWNLOAD (IMDb Style) ==================
+// ================== BATCH DOWNLOAD ==================
 
-// ✅ Fallback download strategy
+// Fallback download strategy using GM_xmlhttpRequest (respects @connect)
 function downloadWithFallback(url, filename) {
     return new Promise((resolve, reject) => {
-        // Try GM_download first
         GM_download({
             url, name: filename,
             onload: () => resolve('gm_download'),
             onerror: (err) => {
                 log('GM_download failed, trying fallback...', 'warn');
-                // Fallback to anchor download
-                fetch(url)
-                    .then(r => {
-                        if (!r.ok) throw new Error('HTTP ' + r.status);
-                        return r.blob();
-                    })
-                    .then(blob => {
-                        const a = document.createElement('a');
-                        const blobUrl = createBlobUrl(blob);
-                        a.href = blobUrl;
-                        a.download = filename;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        revokeBlobUrl(blobUrl);
-                        resolve('fallback');
-                    })
-                    .catch(reject);
+                GM_xmlhttpRequest({
+                    method: 'GET', url: url, responseType: 'blob',
+                    onload: function(resp) {
+                        if (resp.status >= 200 && resp.status < 300) {
+                            const blob = resp.response;
+                            const a = document.createElement('a');
+                            const blobUrl = createBlobUrl(blob);
+                            a.href = blobUrl;
+                            a.download = filename;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            revokeBlobUrl(blobUrl);
+                            resolve('fallback');
+                        } else {
+                            reject(new Error('HTTP ' + resp.status));
+                        }
+                    },
+                    onerror: reject
+                });
             }
         });
-    });
-}
-
-function downloadWithPromise(url, name) {
-    return new Promise((resolve, reject) => {
-        let retryLeft = CONFIG.RETRY_COUNT;
-        const attempt = () => {
-            const timer = setTimeout(() => {
-                if (retryLeft > 0) {
-                    retryLeft--;
-                    log('Retry ' + (CONFIG.RETRY_COUNT - retryLeft) + ' for: ' + name, 'warn');
-                    setTimeout(attempt, CONFIG.RETRY_DELAY_MS);
-                    return;
-                }
-                reject(new Error('timeout'));
-            }, 15000);
-
-            GM_download({
-                url, name,
-                onload() { clearTimeout(timer); resolve('ok'); },
-                onerror(e) {
-                    clearTimeout(timer);
-                    if (retryLeft > 0) {
-                        retryLeft--;
-                        log('Retry ' + (CONFIG.RETRY_COUNT - retryLeft) + ' for: ' + name, 'warn');
-                        setTimeout(attempt, CONFIG.RETRY_DELAY_MS);
-                    } else {
-                        reject(e);
-                    }
-                }
-            });
-        };
-        attempt();
     });
 }
 
@@ -1375,10 +1387,10 @@ function showBatchProgress(total, images, folderName) {
         const thumbUrl = getThumbnailUrl(images[i].src);
         const isSelected = state.batchSelectionMode && state.selectedBatchIndices.has(i);
         thumbsHTML += '<div id="lma-bp-thumb-' + i + '" class="lma-batch-thumb' +
-                     (isSelected ? ' selected' : '') + '" data-index="' + i + '">' +
-                      '<img src="' + thumbUrl + '" onerror="this.style.display=\'none\'" alt="Thumbnail ' + (i+1) + '" />' +
-                      '<div class="lma-batch-thumb-badge" id="lma-bp-badge-' + i + '">' + (i + 1) + '</div>' +
-                      '</div>';
+                     (isSelected ? ' selected' : '') + '" data-index="' + i + '" role="listitem">' +
+                     '<img src="' + thumbUrl + '" alt="Thumbnail ' + (i+1) + '" />' +
+                     '<div class="lma-batch-thumb-badge" id="lma-bp-badge-' + i + '">' + (i + 1) + '</div>' +
+                     '</div>';
     }
 
     ov.innerHTML = '<div class="lma-batch-card">' +
@@ -1403,6 +1415,11 @@ function showBatchProgress(total, images, folderName) {
     '</div>';
 
     document.body.appendChild(ov);
+
+    // Handle broken thumbnails without inline JS (CSP safe)
+    ov.querySelectorAll('.lma-batch-thumb img').forEach(img => {
+        img.onerror = function() { this.style.display = 'none'; };
+    });
 
     // Add click handler for selection mode
     if (state.batchSelectionMode) {
@@ -1508,7 +1525,6 @@ function removeBatchProgress() {
     document.getElementById('lma-batch-overlay')?.remove();
 }
 
-// ✅ Modular batch download functions
 function validateBatchPreconditions() {
     refreshImageList();
     const images = state.allImages;
@@ -1528,46 +1544,37 @@ function prepareBatchMetadata() {
     return { entity, folderName, images };
 }
 
-function confirmBatchDownload(count, folderName) {
-    return confirm('Found ' + count + ' image(s).\n\nDownload all to:\n  Downloads/' + folderName + '/');
-}
+// Custom confirm modal (replaces native confirm())
+function customConfirm(message) {
+    return new Promise(resolve => {
+        const existing = document.getElementById('lma-confirm-overlay');
+        if (existing) existing.remove();
 
-async function executeBatchDownload(images, folderName, entity) {
-    const digits = String(images.length).length;
-    let ok = 0, fail = 0;
+        const ov = document.createElement('div');
+        ov.id = 'lma-confirm-overlay';
+        ov.setAttribute('role', 'dialog');
+        ov.setAttribute('aria-modal', 'true');
+        ov.setAttribute('aria-label', 'Confirm action');
 
-    for (let i = 0; i < images.length; i++) {
-        if (state.batchCancelled) break;
+        ov.innerHTML = '<div class="lma-confirm-card">' +
+            '<p>' + escapeHtml(message) + '</p>' +
+            '<div class="lma-confirm-actions">' +
+                '<button class="lma-confirm-cancel" id="lma-confirm-cancel">Cancel</button>' +
+                '<button class="lma-confirm-ok" id="lma-confirm-ok">OK</button>' +
+            '</div>' +
+        '</div>';
 
-        const img = images[i];
-        const originalIndex = state.allImages.indexOf(img);
-        const fname = makeBatchFilename(folderName, entity, i + 1, digits, originalIndex);
+        document.body.appendChild(ov);
 
-        updateBatchProgress(i + 1, images.length, fname);
-        updateThumbStatus(originalIndex, 'active');
-
-        try {
-            // ✅ Use fallback strategy
-            await downloadWithFallback(img.src, fname);
-            ok++;
-            updateThumbStatus(originalIndex, 'done');
-        } catch (e) {
-            fail++;
-            updateThumbStatus(originalIndex, 'fail');
-            log('Failed: ' + fname + ' - ' + e.message, 'error');
-        }
-
-        updateBatchStats(ok, fail);
-        if (i < images.length - 1 && !state.batchCancelled) {
-            await delay(CONFIG.BATCH_DELAY_MS);
-        }
-    }
-
-    return { ok, fail };
-}
-
-function showBatchResults(results, cancelled, folderName) {
-    finishBatchProgress(results.ok, results.fail, cancelled, folderName);
+        document.getElementById('lma-confirm-cancel').onclick = () => {
+            ov.remove();
+            resolve(false);
+        };
+        document.getElementById('lma-confirm-ok').onclick = () => {
+            ov.remove();
+            resolve(true);
+        };
+    });
 }
 
 async function batchDownload() {
@@ -1577,7 +1584,8 @@ async function batchDownload() {
 
     const { entity, folderName, images } = prepareBatchMetadata();
 
-    if (!confirmBatchDownload(images.length, folderName)) {
+    const confirmed = await customConfirm('Found ' + images.length + ' image(s).\n\nDownload all to:\n  Downloads/' + folderName + '/');
+    if (!confirmed) {
         return;
     }
 
@@ -1601,6 +1609,43 @@ async function batchDownload() {
     }
 }
 
+async function executeBatchDownload(images, folderName, entity) {
+    const digits = String(images.length).length;
+    let ok = 0, fail = 0;
+
+    for (let i = 0; i < images.length; i++) {
+        if (state.batchCancelled) break;
+
+        const img = images[i];
+        const originalIndex = state.allImages.indexOf(img);
+        const fname = makeBatchFilename(folderName, entity, i + 1, digits, originalIndex);
+
+        updateBatchProgress(i + 1, images.length, fname);
+        updateThumbStatus(originalIndex, 'active');
+
+        try {
+            await downloadWithFallback(img.src, fname);
+            ok++;
+            updateThumbStatus(originalIndex, 'done');
+        } catch (e) {
+            fail++;
+            updateThumbStatus(originalIndex, 'fail');
+            log('Failed: ' + fname + ' - ' + e.message, 'error');
+        }
+
+        updateBatchStats(ok, fail);
+        if (i < images.length - 1 && !state.batchCancelled) {
+            await delay(CONFIG.BATCH_DELAY_MS);
+        }
+    }
+
+    return { ok, fail };
+}
+
+function showBatchResults(results, cancelled, folderName) {
+    finishBatchProgress(results.ok, results.fail, cancelled, folderName);
+}
+
 // ================== EVENT LISTENERS ==================
 function attachEvents() {
     elements.prevBtn.addEventListener('click', () => navigateTo(state.currentIndex - 1));
@@ -1619,11 +1664,13 @@ function attachEvents() {
         batchDownload();
     });
 
-    // ✅ Batch selection toggle
     elements.batchSelectToggle.addEventListener('click', () => {
         state.batchSelectionMode = !state.batchSelectionMode;
         elements.batchSelectToggle.classList.toggle('active', state.batchSelectionMode);
         elements.batchSelectToggle.setAttribute('aria-pressed', state.batchSelectionMode);
+        if (!state.batchSelectionMode) {
+            state.selectedBatchIndices.clear();
+        }
         GM_notification({
             text: state.batchSelectionMode ? 'Selection mode ON - click thumbnails to select' : 'Selection mode OFF',
             title: 'Batch Download'
@@ -1645,7 +1692,6 @@ function attachEvents() {
         if (!target) return;
         if (target.closest('#lma-lightbox')) return;
 
-        // ✅ Visual feedback for non-target images
         if (!isValidTargetImage(target)) {
             target.style.outline = '2px dashed rgba(255,100,100,0.7)';
             setTimeout(() => { target.style.outline = ''; }, 300);
@@ -1755,14 +1801,13 @@ function observeMutations() {
         refreshImageList();
     }, CONFIG.DEBOUNCE_DELAY));
 
-    // ✅ Observe specific containers instead of entire body
     const targets = [
         document.querySelector('.chat-container'),
         document.querySelector('.message-list'),
         document.querySelector('.image-gallery'),
         document.querySelector('[class*="content"]'),
         document.querySelector('[class*="chat"]'),
-        document.body // Fallback
+        document.body
     ].filter(el => el);
 
     targets.forEach(target => {
@@ -1816,7 +1861,10 @@ function init() {
     refreshImageList();
     observeMutations();
 
-    // ✅ Check for updates after short delay
+    // Handle SPA route changes
+    window.addEventListener('popstate', refreshImageList);
+    window.addEventListener('hashchange', refreshImageList);
+
     setTimeout(checkForUpdates, 5000);
 
     state.initialized = true;
